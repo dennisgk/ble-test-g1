@@ -848,11 +848,11 @@ extern "C" void app_main(void) {
     setup_privacy();
     setup_security();
 
-    anki_remote_init();
-
     ESP_ERROR_CHECK(esp_ble_gap_register_callback(gap_cb));
     ESP_ERROR_CHECK(esp_ble_gattc_register_callback(gattc_cb));
     ESP_ERROR_CHECK(esp_ble_gatts_register_callback(gatts_cb));
+
+    anki_remote_init();
 
     // Register both apps
     ESP_ERROR_CHECK(esp_ble_gattc_app_register(0xAB));
