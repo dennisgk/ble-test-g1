@@ -297,9 +297,12 @@ static bool g_scan_active = false;
 static bool g_have_target = false;
 static bool g_connecting = false;
 static bool g_connected = false;
+static bool g_target_is_left = false;
 
 static esp_bd_addr_t g_target_bda;
 static esp_ble_addr_type_t g_target_addr_type = BLE_ADDR_TYPE_PUBLIC;
+static esp_bd_addr_t g_left_bda = {0};
+static esp_bd_addr_t g_right_bda = {0};
 
 static uint16_t g_conn_id = 0;
 
@@ -325,6 +328,17 @@ static esp_ble_scan_params_t g_scan_params = {
 // Change these to match your glasses advertising names more precisely
 static const char *TARGET_NAME_CONTAINS_1 = "G1_59_L";
 static const char *TARGET_NAME_CONTAINS_2 = "G1_59_R";
+
+enum class ConnectStage {
+    WAIT_ANKI,
+    LEFT,
+    RIGHT,
+    READY,
+};
+
+static ConnectStage g_stage = ConnectStage::WAIT_ANKI;
+static bool g_left_connected = false;
+static bool g_right_connected = false;
 
 static uint8_t g_text_seq = 0;
 
@@ -459,7 +473,8 @@ static void request_notify_enable(void);
 
 static void connect_target(void) {
     if (!g_have_target) return;
-    if (g_connected || g_connecting) return;
+    if (g_connecting) return;
+    if (g_connected && g_stage != ConnectStage::RIGHT) return;
     if (g_scan_active) {
         stop_scan(); // connect after scan stop complete
         return;
@@ -486,8 +501,32 @@ static void discover_services(void) {
     esp_ble_gattc_search_service(g_gattc_if, g_conn_id, NULL);
 }
 
+static void advance_stage_if_ready(void) {
+    if (g_stage == ConnectStage::WAIT_ANKI && anki_remote_is_connected()) {
+        g_stage = ConnectStage::LEFT;
+        g_have_target = false;
+        scan_once(5);
+        return;
+    }
+
+    if (g_stage == ConnectStage::LEFT && g_left_connected) {
+        g_stage = ConnectStage::RIGHT;
+        g_have_target = false;
+        g_connecting = false;
+        g_connected = false;
+        scan_once(5);
+        return;
+    }
+
+    if (g_stage == ConnectStage::RIGHT && g_right_connected) {
+        g_stage = ConnectStage::READY;
+    }
+}
+
 static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
     anki_remote_on_gattc_event(event, gattc_if, param);
+
+    advance_stage_if_ready();
 
     switch (event) {
     case ESP_GATTC_REG_EVT:
@@ -526,6 +565,18 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble
         ESP_LOGW(TAG, "GATTC disconnected reason=0x%x", param->disconnect.reason);
         g_connected = false;
         g_connecting = false;
+        if (memcmp(param->disconnect.remote_bda, g_left_bda, ESP_BD_ADDR_LEN) == 0) {
+            g_left_connected = false;
+        }
+        if (memcmp(param->disconnect.remote_bda, g_right_bda, ESP_BD_ADDR_LEN) == 0) {
+            g_right_connected = false;
+        }
+
+        if (!g_right_connected) {
+            g_stage = ConnectStage::RIGHT;
+        } else if (!g_left_connected) {
+            g_stage = ConnectStage::LEFT;
+        }
         g_have_target = false;
 
         if (g_hb_task) {
@@ -608,6 +659,15 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble
         if (g_rx_found) {
             request_notify_enable();
         }
+
+        if (g_service_found && g_tx_found && g_rx_found) {
+            if (g_target_is_left) {
+                g_left_connected = true;
+            } else {
+                g_right_connected = true;
+            }
+            advance_stage_if_ready();
+        }
         break;
     }
 
@@ -672,6 +732,8 @@ static void request_notify_enable(void) {
 static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
     anki_remote_on_gap_event(event, param);
 
+    advance_stage_if_ready();
+
     switch (event) {
     case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
         // Start advertising once adv data configured
@@ -696,6 +758,11 @@ static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) 
     case ESP_GAP_BLE_SCAN_RESULT_EVT: {
         if (param->scan_rst.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT) break;
 
+        advance_stage_if_ready();
+
+        if (g_stage == ConnectStage::WAIT_ANKI) break;
+        if (g_stage == ConnectStage::LEFT && !anki_remote_is_connected()) break;
+
         // Resolve adv name
         uint8_t name_len = 0;
         const uint8_t *name = esp_ble_resolve_adv_data(
@@ -708,12 +775,26 @@ static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) 
         memcpy(nbuf, name, cpy);
 
         // Extremely loose matching (you should tighten this!)
-        bool match = (strstr(nbuf, TARGET_NAME_CONTAINS_1) != NULL) || (strstr(nbuf, TARGET_NAME_CONTAINS_2) != NULL);
+        bool match_left = strstr(nbuf, TARGET_NAME_CONTAINS_1) != NULL;
+        bool match_right = strstr(nbuf, TARGET_NAME_CONTAINS_2) != NULL;
+        bool match = false;
+
+        if (g_stage == ConnectStage::LEFT) {
+            match = match_left;
+        } else if (g_stage == ConnectStage::RIGHT) {
+            match = match_right;
+        }
         if (match) {
             ESP_LOGI(TAG, "Found candidate: %s", nbuf);
             memcpy(g_target_bda, param->scan_rst.bda, ESP_BD_ADDR_LEN);
             g_target_addr_type = param->scan_rst.ble_addr_type;
             g_have_target = true;
+            g_target_is_left = (g_stage == ConnectStage::LEFT);
+            if (g_target_is_left) {
+                memcpy(g_left_bda, param->scan_rst.bda, ESP_BD_ADDR_LEN);
+            } else {
+                memcpy(g_right_bda, param->scan_rst.bda, ESP_BD_ADDR_LEN);
+            }
 
             // Stop scan then connect (python-style)
             stop_scan();
