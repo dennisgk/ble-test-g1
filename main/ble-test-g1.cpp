@@ -294,6 +294,8 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble
 static esp_gatt_if_t g_gattc_if = ESP_GATT_IF_NONE;
 
 static bool g_scan_active = false;
+static bool g_scan_pending = false;
+static uint32_t g_scan_pending_seconds = 0;
 static bool g_have_target = false;
 static bool g_connecting = false;
 static bool g_connected = false;
@@ -450,8 +452,18 @@ static void heartbeat_task(void *arg) {
     }
 }
 
+static void stop_scan(void);
+
 static void scan_once(uint32_t seconds) {
-    if (g_scan_active) return;
+    if (g_scan_active) {
+        // Defer until current scan window ends/stops
+        g_scan_pending = true;
+        g_scan_pending_seconds = seconds;
+        stop_scan();
+        return;
+    }
+
+    g_scan_pending = false;
     ESP_LOGI(TAG, "GATTC: scan for %us", (unsigned)seconds);
     esp_err_t err = esp_ble_gap_start_scanning(seconds);
     if (err == ESP_OK) g_scan_active = true;
@@ -503,6 +515,7 @@ static void discover_services(void) {
 
 static void advance_stage_if_ready(void) {
     if (g_stage == ConnectStage::WAIT_ANKI && anki_remote_is_connected()) {
+        ESP_LOGI(TAG, "Stage advance: WAIT_ANKI -> LEFT");
         g_stage = ConnectStage::LEFT;
         g_have_target = false;
         scan_once(5);
@@ -510,6 +523,7 @@ static void advance_stage_if_ready(void) {
     }
 
     if (g_stage == ConnectStage::LEFT && g_left_connected) {
+        ESP_LOGI(TAG, "Stage advance: LEFT -> RIGHT");
         g_stage = ConnectStage::RIGHT;
         g_have_target = false;
         g_connecting = false;
@@ -519,6 +533,7 @@ static void advance_stage_if_ready(void) {
     }
 
     if (g_stage == ConnectStage::RIGHT && g_right_connected) {
+        ESP_LOGI(TAG, "Stage advance: RIGHT -> READY");
         g_stage = ConnectStage::READY;
     }
 }
@@ -753,6 +768,13 @@ static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) 
         g_scan_active = false;
         // If we found target while scanning, connect now
         if (g_have_target && !g_connected && !g_connecting) connect_target();
+
+        if (g_scan_pending) {
+            uint32_t secs = g_scan_pending_seconds;
+            g_scan_pending = false;
+            g_scan_pending_seconds = 0;
+            scan_once(secs);
+        }
         break;
 
     case ESP_GAP_BLE_SCAN_RESULT_EVT: {
