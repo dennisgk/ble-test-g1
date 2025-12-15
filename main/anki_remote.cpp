@@ -16,6 +16,7 @@ static const uint16_t APP_ID_ANKI = 0x42;
 static bool s_inited = false;
 static bool s_found = false;
 static bool s_connecting = false;
+static bool s_connected = false;
 
 static esp_gatt_if_t s_gattc_if = ESP_GATT_IF_NONE;
 static uint16_t s_conn_id = 0xFFFF;
@@ -282,6 +283,7 @@ void anki_remote_on_gattc_event(esp_gattc_cb_event_t event,
 
             if (param->open.status != ESP_GATT_OK) {
                 s_connecting = false;
+                s_connected = false;
                 ESP_LOGE(TAG, "OPEN failed status=%d", (int)param->open.status);
                 break;
             }
@@ -289,6 +291,7 @@ void anki_remote_on_gattc_event(esp_gattc_cb_event_t event,
             s_conn_id = param->open.conn_id;
             memcpy(s_bda, param->open.remote_bda, sizeof(esp_bd_addr_t));
             ESP_LOGI(TAG, "Connected conn_id=%u", (unsigned)s_conn_id);
+            s_connected = true;
 
             s_hid_service_found = false;
             s_hid_start = s_hid_end = 0;
@@ -340,6 +343,7 @@ void anki_remote_on_gattc_event(esp_gattc_cb_event_t event,
 
             ESP_LOGW(TAG, "Disconnected reason=0x%02X", param->disconnect.reason);
             s_connecting = false;
+            s_connected = false;
             s_conn_id = 0xFFFF;
             s_hid_service_found = false;
             s_report_char_handle = 0;
@@ -351,4 +355,8 @@ void anki_remote_on_gattc_event(esp_gattc_cb_event_t event,
         default:
             break;
     }
+}
+
+bool anki_remote_is_connected(void) {
+    return s_connected;
 }

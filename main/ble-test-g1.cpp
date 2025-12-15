@@ -294,12 +294,24 @@ static void gatts_cb(esp_gatts_cb_event_t event, esp_gatt_if_t gatts_if, esp_ble
 static esp_gatt_if_t g_gattc_if = ESP_GATT_IF_NONE;
 
 static bool g_scan_active = false;
+static bool g_scan_pending = false;
+static uint32_t g_scan_pending_seconds = 0;
 static bool g_have_target = false;
 static bool g_connecting = false;
 static bool g_connected = false;
+static bool g_target_is_left = false;
+
+struct DeviceInfo {
+    bool seen = false;
+    bool connected = false;
+    esp_bd_addr_t bda = {0};
+    esp_ble_addr_type_t addr_type = BLE_ADDR_TYPE_PUBLIC;
+};
 
 static esp_bd_addr_t g_target_bda;
 static esp_ble_addr_type_t g_target_addr_type = BLE_ADDR_TYPE_PUBLIC;
+static DeviceInfo g_left;
+static DeviceInfo g_right;
 
 static uint16_t g_conn_id = 0;
 
@@ -325,6 +337,15 @@ static esp_ble_scan_params_t g_scan_params = {
 // Change these to match your glasses advertising names more precisely
 static const char *TARGET_NAME_CONTAINS_1 = "G1_59_L";
 static const char *TARGET_NAME_CONTAINS_2 = "G1_59_R";
+
+enum class ConnectStage {
+    WAIT_ANKI,
+    LEFT,
+    RIGHT,
+    READY,
+};
+
+static ConnectStage g_stage = ConnectStage::WAIT_ANKI;
 
 static uint8_t g_text_seq = 0;
 
@@ -436,8 +457,20 @@ static void heartbeat_task(void *arg) {
     }
 }
 
+static void stop_scan(void);
+static void drive_workflow(void);
+static void ensure_scan_window(uint32_t seconds);
+
 static void scan_once(uint32_t seconds) {
-    if (g_scan_active) return;
+    if (g_scan_active) {
+        // Defer until current scan window ends/stops
+        g_scan_pending = true;
+        g_scan_pending_seconds = seconds;
+        stop_scan();
+        return;
+    }
+
+    g_scan_pending = false;
     ESP_LOGI(TAG, "GATTC: scan for %us", (unsigned)seconds);
     esp_err_t err = esp_ble_gap_start_scanning(seconds);
     if (err == ESP_OK) g_scan_active = true;
@@ -450,6 +483,11 @@ static void stop_scan(void) {
     // clear g_scan_active only on STOP_COMPLETE
 }
 
+static void ensure_scan_window(uint32_t seconds) {
+    if (g_have_target || g_connecting) return;
+    scan_once(seconds);
+}
+
 static void request_notify_enable(void);
 
 // Compatibility: some IDF versions don’t have INVALID_HANDLE
@@ -459,7 +497,8 @@ static void request_notify_enable(void);
 
 static void connect_target(void) {
     if (!g_have_target) return;
-    if (g_connected || g_connecting) return;
+    if (g_connecting) return;
+    if (g_connected && g_stage != ConnectStage::RIGHT) return;
     if (g_scan_active) {
         stop_scan(); // connect after scan stop complete
         return;
@@ -486,8 +525,72 @@ static void discover_services(void) {
     esp_ble_gattc_search_service(g_gattc_if, g_conn_id, NULL);
 }
 
+static void set_target_from_device(DeviceInfo &dev, bool is_left) {
+    memcpy(g_target_bda, dev.bda, ESP_BD_ADDR_LEN);
+    g_target_addr_type = dev.addr_type;
+    g_have_target = true;
+    g_target_is_left = is_left;
+}
+
+static void drive_workflow(void) {
+    bool anki_ok = anki_remote_is_connected();
+
+    if (!anki_ok) {
+        if (g_stage != ConnectStage::WAIT_ANKI) {
+            ESP_LOGI(TAG, "Stage reset: waiting for Anki Remote");
+            g_stage = ConnectStage::WAIT_ANKI;
+            g_have_target = false;
+        }
+        ensure_scan_window(5);
+        return;
+    }
+
+    if (g_stage == ConnectStage::WAIT_ANKI) {
+        ESP_LOGI(TAG, "Stage advance: WAIT_ANKI -> LEFT");
+        g_stage = ConnectStage::LEFT;
+        g_have_target = false;
+    }
+
+    if (g_stage == ConnectStage::LEFT) {
+        if (g_left.connected) {
+            ESP_LOGI(TAG, "Stage advance: LEFT -> RIGHT");
+            g_stage = ConnectStage::RIGHT;
+            g_have_target = false;
+        } else {
+            if (!g_left.seen) {
+                ensure_scan_window(5);
+                return;
+            }
+            if (!g_have_target || !g_target_is_left) {
+                set_target_from_device(g_left, true);
+            }
+            connect_target();
+            return;
+        }
+    }
+
+    if (g_stage == ConnectStage::RIGHT) {
+        if (g_right.connected) {
+            ESP_LOGI(TAG, "Stage advance: RIGHT -> READY");
+            g_stage = ConnectStage::READY;
+            g_have_target = false;
+        } else {
+            if (!g_right.seen) {
+                ensure_scan_window(5);
+                return;
+            }
+            if (!g_have_target || g_target_is_left) {
+                set_target_from_device(g_right, false);
+            }
+            connect_target();
+            return;
+        }
+    }
+}
+
 static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble_gattc_cb_param_t *param) {
     anki_remote_on_gattc_event(event, gattc_if, param);
+    drive_workflow();
 
     switch (event) {
     case ESP_GATTC_REG_EVT:
@@ -503,6 +606,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble
             g_connected = false;
             g_have_target = false;
             scan_once(5);
+            drive_workflow();
         }
         break;
 
@@ -520,12 +624,25 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble
 
         // Don’t start aggressive GATT ops until auth completes; but we’ll kick discovery anyway.
         discover_services();
+        drive_workflow();
         break;
 
     case ESP_GATTC_DISCONNECT_EVT:
         ESP_LOGW(TAG, "GATTC disconnected reason=0x%x", param->disconnect.reason);
         g_connected = false;
         g_connecting = false;
+        if (memcmp(param->disconnect.remote_bda, g_left.bda, ESP_BD_ADDR_LEN) == 0) {
+            g_left.connected = false;
+        }
+        if (memcmp(param->disconnect.remote_bda, g_right.bda, ESP_BD_ADDR_LEN) == 0) {
+            g_right.connected = false;
+        }
+
+        if (!g_right.connected) {
+            g_stage = ConnectStage::RIGHT;
+        } else if (!g_left.connected) {
+            g_stage = ConnectStage::LEFT;
+        }
         g_have_target = false;
 
         if (g_hb_task) {
@@ -535,6 +652,7 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble
         g_hb_seq = 0;
 
         scan_once(5);
+        drive_workflow();
         break;
 
     case ESP_GATTC_SEARCH_RES_EVT: {
@@ -608,6 +726,15 @@ static void gattc_cb(esp_gattc_cb_event_t event, esp_gatt_if_t gattc_if, esp_ble
         if (g_rx_found) {
             request_notify_enable();
         }
+
+        if (g_service_found && g_tx_found && g_rx_found) {
+            if (g_target_is_left) {
+                g_left.connected = true;
+            } else {
+                g_right.connected = true;
+            }
+            drive_workflow();
+        }
         break;
     }
 
@@ -671,6 +798,7 @@ static void request_notify_enable(void) {
 // -------------------- GAP callback (shared) --------------------
 static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
     anki_remote_on_gap_event(event, param);
+    drive_workflow();
 
     switch (event) {
     case ESP_GAP_BLE_ADV_DATA_SET_COMPLETE_EVT:
@@ -691,6 +819,15 @@ static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) 
         g_scan_active = false;
         // If we found target while scanning, connect now
         if (g_have_target && !g_connected && !g_connecting) connect_target();
+
+        if (g_scan_pending) {
+            uint32_t secs = g_scan_pending_seconds;
+            g_scan_pending = false;
+            g_scan_pending_seconds = 0;
+            scan_once(secs);
+        } else {
+            drive_workflow();
+        }
         break;
 
     case ESP_GAP_BLE_SCAN_RESULT_EVT: {
@@ -707,17 +844,39 @@ static void gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) 
         int cpy = name_len < 31 ? name_len : 31;
         memcpy(nbuf, name, cpy);
 
-        // Extremely loose matching (you should tighten this!)
-        bool match = (strstr(nbuf, TARGET_NAME_CONTAINS_1) != NULL) || (strstr(nbuf, TARGET_NAME_CONTAINS_2) != NULL);
-        if (match) {
-            ESP_LOGI(TAG, "Found candidate: %s", nbuf);
-            memcpy(g_target_bda, param->scan_rst.bda, ESP_BD_ADDR_LEN);
-            g_target_addr_type = param->scan_rst.ble_addr_type;
-            g_have_target = true;
+        bool match_left = strstr(nbuf, TARGET_NAME_CONTAINS_1) != NULL;
+        bool match_right = strstr(nbuf, TARGET_NAME_CONTAINS_2) != NULL;
+
+        if (match_left) {
+            memcpy(g_left.bda, param->scan_rst.bda, ESP_BD_ADDR_LEN);
+            g_left.addr_type = param->scan_rst.ble_addr_type;
+            g_left.seen = true;
+            ESP_LOGI(TAG, "Found candidate LEFT: %s", nbuf);
+        }
+
+        if (match_right) {
+            memcpy(g_right.bda, param->scan_rst.bda, ESP_BD_ADDR_LEN);
+            g_right.addr_type = param->scan_rst.ble_addr_type;
+            g_right.seen = true;
+            ESP_LOGI(TAG, "Found candidate RIGHT: %s", nbuf);
+        }
+
+        if ((match_left && g_stage == ConnectStage::LEFT) || (match_right && g_stage == ConnectStage::RIGHT)) {
+            set_target_from_device(match_left ? g_left : g_right, match_left);
 
             // Stop scan then connect (python-style)
-            stop_scan();
+            if (g_scan_active) {
+                stop_scan();
+                // Fallback: proceed immediately in case stop event is delayed
+                g_scan_active = false;
+                connect_target();
+            } else {
+                ESP_LOGI(TAG, "Scan already stopped; connecting now");
+                connect_target();
+            }
         }
+
+        drive_workflow();
         break;
     }
 
@@ -767,11 +926,11 @@ extern "C" void app_main(void) {
     setup_privacy();
     setup_security();
 
-    anki_remote_init();
-
     ESP_ERROR_CHECK(esp_ble_gap_register_callback(gap_cb));
     ESP_ERROR_CHECK(esp_ble_gattc_register_callback(gattc_cb));
     ESP_ERROR_CHECK(esp_ble_gatts_register_callback(gatts_cb));
+
+    anki_remote_init();
 
     // Register both apps
     ESP_ERROR_CHECK(esp_ble_gattc_app_register(0xAB));
